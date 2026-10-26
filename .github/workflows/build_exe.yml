@@ -1,0 +1,41 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Build EXE with PyInstaller
+      run: |
+        pyinstaller --noconsole --onefile --name "EcusHelper" app.py
+
+    - name: Prepare distribution bundle
+      run: |
+        copy Template.xlsx dist\Template.xlsx
+        mkdir dist\input
+        mkdir dist\output
+
+    - name: Upload Windows EXE Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: EcusHelper-Windows
+        path: dist/
