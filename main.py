@@ -1,20 +1,17 @@
-import sys
 from pathlib import Path
 from copy import copy
+import json
+import os
 from datetime import datetime
 import re
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 from openpyxl.cell.cell import MergedCell
 
-
 # ===== CAU HINH =====
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).resolve().parent
-else:
-    BASE_DIR = Path(__file__).resolve().parent
-INPUT_FOLDER = BASE_DIR / "input" if (BASE_DIR / "input").exists() else BASE_DIR
-TEMPLATE = BASE_DIR / "Template.xlsx"
-OUTPUT = BASE_DIR / "output"
+FOLDER = Path(r"D:\test\Don hang\Aldila xuat")   # bo file "IV + PL G-*.xlsx" + Template_aldila.xlsx vao day
+TEMPLATE = FOLDER / "Template_aldila.xlsx"
+OUTPUT = FOLDER / "output"                         # Template G-xx-xxxx.xlsx (ECUS doc tu day)
 
 LABELS = [
     "Mode of Delivery:",
@@ -50,7 +47,9 @@ PL_MARKER = "packing list no"      # sheet PL: o tieu de 'PACKING LIST NO.' (don
 TABLE_HEADER_TEXT = "Aldila part"  # tieu de cot dau tien cua bang o file nguon
 TABLE_STOP_TEXT = "total"          # dung khi gap dong co o = TOTAL
 TABLE_FIRST_COL = 9                # cot I o file nguon (Aldila part, o tieu de merge I:J)
-TABLE_LAST_COL = 17                # cot Q o file nguon ((2) Custom amount - Extension)
+TABLE_LAST_COL = 20                # gioi han quet chung (cot T). Cot cua bang hang duoc nhan theo TIEU DE, khong theo so nay
+# Neu khong nhan ra tieu de thi dung vi tri cu (bang khong co cot Brand name): I,J,K,L,M,N,O,P,Q
+LEGACY_TABLE_COLS = [9, 10, 11, 12, 13, 14, 15, 16, 17]
 COPY_HEADER = False                # True = copy luon cac dong tieu de cua nguon
 HEADER_ROWS_ABOVE = 1              # so dong tieu de nam tren dong 'Aldila part' (chi dung khi COPY_HEADER = True)
 
@@ -67,9 +66,9 @@ EXTRA_ROWS_MODE = "hide"               # "hide" = an dong du (giu cong thuc) | "
 # O dich trong template cho dong dong goi + KGS: (ten sheet, o). De None = chua ghi.
 # Vi du: "qty": ("Sheet1", "C30")
 PACK_TARGETS = {
-    "qty": ("Sheet1", "B16"),    # so luong, vi du 9
-    "kind": ("Sheet1", "B17"),   # loai, vi du BOX / PLASTIC PALLET_big
-    "kgs": ("Sheet1", "B18"),    # trong luong KGS, vi du 31.5 / 319.5
+    "qty": ("Sheet1", "B19"),    # so luong, vi du 9
+    "kind": ("Sheet1", "B20"),   # loai, vi du BOX / PLASTIC PALLET_big
+    "kgs": ("Sheet1", "B21"),    # trong luong KGS, vi du 31.5 / 319.5
 }
 
 # Nhan dang dong dong goi: o chi chua dung 1 trong cac chu nay (khop dung ca o, khong nham voi 'BOXES')
@@ -81,22 +80,28 @@ PACK_EXACT_KEYWORDS = ("box", "bundle", "package")
 # O dich trong template cho so invoice + ngay ship (sheet IV). De None = chua ghi.
 # Vi du: "invoice_no": ("Sheet1", "C2")
 INFO_TARGETS = {
-    "invoice_no": ("Sheet1", "B21"),   # vi du G-26-1040
-    "ship_date": ("Sheet1", "B22"),    # vi du 16/10/2026
+    "invoice_no": ("Sheet1", "B24"),   # vi du G-26-1040
+    "ship_date": ("Sheet1", "B25"),    # vi du 16/10/2026
 }
 DATE_FORMAT = "dd/mm/yyyy"   # dinh dang ngay khi ghi vao template (None = giu dinh dang cua o template)
 
 # O dich trong template cho 2 tong tien (dong TOTAL, sheet IV). De None = chua ghi.
 TOTALS_TARGETS = {
-    "processing_total": ("Sheet1", "B25"),   # tong tien gia cong (Processing Fee - Extension), vi du 154.80
-    "custom_total": ("Sheet1", "B27"),       # tong tien hang (Custom amount - Extension), vi du 272.20
+    "processing_total": ("Sheet1", "B28"),   # tong tien gia cong (Processing Fee - Extension), vi du 154.80
+    "custom_total": ("Sheet1", "B30"),       # Tong tri gia hoa don (Custom amount - Extension), vi du 272.20.
+                                             # B29 (NVL) la cong thuc =B30-B28 trong Template, khong ghi de.
 }
 
 # O dich trong template cho Currency + Ship to Name (sheet IV). De None = chua ghi.
 MISC_TARGETS = {
-    "currency": ("Sheet1", "C12"),       # vi du USD
-    "ship_to_name": ("Sheet1", "C13"),   # vi du ACUSHNET EUROPE LTD.
+    "currency": ("Sheet1", "C16"),       # vi du USD
+    "ship_to_name": ("Sheet1", "C17"),   # vi du ACUSHNET EUROPE LTD.
 }
+
+# Tu dien san C10 / C11 / C32 theo lan khai truoc (ecus_fill_demo.py ghi file nay sau moi lan khai xong)
+FILE_NHO = "nho_ma.json"            # nam trong thu muc khach (FOLDER)
+# Sau khi chay xong, tu mo trong Excel nhung file con thieu (dong 2 Sheet1 bao CHUA DU)
+MO_FILE_THIEU = True
 
 # Nho Excel tinh san cong thuc roi luu lai (can Excel + pywin32: pip install pywin32)
 RECALC_WITH_EXCEL = True
@@ -266,13 +271,63 @@ def find_total_row(ws, start_row):
     return None
 
 
-def has_part(ws, r):
-    """Dong hang that su: o 'Aldila part' (cot I hoac J) co du lieu."""
-    for c in (TABLE_FIRST_COL, TABLE_FIRST_COL + 1):
+def has_part(ws, r, cols=(TABLE_FIRST_COL, TABLE_FIRST_COL + 1)):
+    """Dong hang that su: o 'Aldila part' (mac dinh cot I hoac J) co du lieu."""
+    for c in cols:
         v = real_cell(ws, r, c).value
         if v is not None and str(v).strip() != "":
             return True
     return False
+
+
+def table_columns(ws, head):
+    """Vi tri 9 cot cua bang hang theo TIEU DE (khong theo vi tri co dinh), dung thu tu cua template A..I:
+    [Aldila part (2 cot), Descriptions of goods, PCS, BOXES, Processing Unit, Processing Extension,
+    Custom Unit, Custom Extension]. Cot khac nam xen giua (vi du Brand name) se tu bi bo qua.
+    Tra ve None neu khong nhan ra du tieu de."""
+    rng = merged_range(ws, head)
+    a1 = rng.min_col if rng else head.column
+    a2 = rng.max_col if (rng and rng.max_col > rng.min_col) else a1 + 1
+
+    desc = pcs = boxes = None
+    units, exts = set(), set()
+    for r in (head.row - 1, head.row):        # dong nhom tieu de + dong tieu de con
+        if r < 1:
+            continue
+        for c in range(a1, TABLE_LAST_COL + 1):
+            t = norm(ws.cell(r, c).value)
+            if not t:
+                continue
+            if t.startswith("descriptions of goods") and desc is None:
+                desc = c
+            elif t == "pcs" and pcs is None:
+                pcs = c
+            elif t == "boxes" and boxes is None:
+                boxes = c
+            elif t == "unit":
+                units.add(c)
+            elif t == "extension":
+                exts.add(c)
+    units, exts = sorted(units), sorted(exts)
+    if None in (desc, pcs, boxes) or len(units) < 2 or len(exts) < 2:
+        return None
+    cols = [a1, a2, desc, pcs, boxes, units[0], exts[0], units[1], exts[1]]
+    if cols != sorted(set(cols)):             # phai tang dan, khong trung
+        return None
+    return cols
+
+
+def header_last_col(ws, head_row):
+    """Cot cuoi cung cua bang = cot xa nhat co chu o 2 dong tieu de (tinh ca o merge)."""
+    last = 0
+    for r in (head_row - 1, head_row):
+        if r < 1:
+            continue
+        for cell in ws[r]:
+            if cell.value is not None and str(cell.value).strip():
+                rng = merged_range(ws, cell)
+                last = max(last, rng.max_col if rng else cell.column)
+    return last or TABLE_LAST_COL
 
 
 def copy_table(source_wb, target_wb):
@@ -293,7 +348,13 @@ def copy_table(source_wb, target_wb):
         print("  Khong tim thay dong TOTAL trong file nguon")
         return False
 
-    data_rows = [r for r in range(data_first, total_row) if has_part(s_ws, r)]
+    cols = table_columns(s_ws, s_head)
+    if cols is None:
+        cols = LEGACY_TABLE_COLS
+        print("  [CANH BAO] Khong nhan ra du tieu de cac cot cua bang (Descriptions/PCS/BOXES/Unit/Extension), "
+              "dung vi tri cu I..Q")
+
+    data_rows = [r for r in range(data_first, total_row) if has_part(s_ws, r, (cols[0], cols[1]))]
     if not data_rows:
         print("  Bang khong co dong du lieu nao")
         return False
@@ -304,7 +365,7 @@ def copy_table(source_wb, target_wb):
 
     src_rows = header_rows + data_rows
     row_map = {r: TARGET_START_ROW + i for i, r in enumerate(src_rows)}  # dong nguon -> dong dich
-    col_offset = TARGET_START_COL - TABLE_FIRST_COL
+    col_map = {src: TARGET_START_COL + i for i, src in enumerate(cols)}   # cot nguon -> cot dich
 
     # Tim sheet dich trong template (khong phan biet hoa thuong)
     t_ws = None
@@ -322,11 +383,11 @@ def copy_table(source_wb, target_wb):
             if height:
                 t_ws.row_dimensions[tr].height = height
 
-        for c in range(TABLE_FIRST_COL, TABLE_LAST_COL + 1):
+        for c, dcol in col_map.items():
             src = s_ws.cell(r, c)
             if isinstance(src, MergedCell):
                 continue
-            dst = t_ws.cell(tr, c + col_offset)
+            dst = t_ws.cell(tr, dcol)
             if isinstance(dst, MergedCell):
                 continue
 
@@ -343,20 +404,25 @@ def copy_table(source_wb, target_wb):
         for rng in s_ws.merged_cells.ranges:
             if (
                 rng.min_row in row_map and rng.max_row in row_map
-                and rng.min_col >= TABLE_FIRST_COL and rng.max_col <= TABLE_LAST_COL
+                and rng.min_col in col_map and rng.max_col in col_map
             ):
                 try:
                     t_ws.merge_cells(
-                        start_row=row_map[rng.min_row], start_column=rng.min_col + col_offset,
-                        end_row=row_map[rng.max_row], end_column=rng.max_col + col_offset,
+                        start_row=row_map[rng.min_row], start_column=col_map[rng.min_col],
+                        end_row=row_map[rng.max_row], end_column=col_map[rng.max_col],
                     )
                 except Exception:
                     pass
 
     n = len(src_rows)
     skipped = (total_row - data_first) - len(data_rows)
+    letters = ",".join(get_column_letter(c) for c in cols)
+    left_out = [get_column_letter(c) for c in range(cols[0], cols[-1] + 1) if c not in cols]
     print(f"  Da copy bang: {len(data_rows)} dong hang (nguon dong {data_first}-{total_row - 1}, "
           f"bo qua {skipped} dong trong/ghi chu) -> {t_ws.title}!A{TARGET_START_ROW}")
+    print(f"  Cot nguon da lay: {letters}  (-> cot {get_column_letter(TARGET_START_COL)} den "
+          f"{get_column_letter(TARGET_START_COL + len(cols) - 1)} cua template)"
+          + (f"; bo qua cot: {','.join(left_out)}" if left_out else ""))
     return n
 
 
@@ -421,6 +487,10 @@ def extract_packing(source_wb):
     result = {"sheet": ws.title, "qty": None, "qty_cell": None, "kind": None,
               "kind_cell": None, "kgs": None, "kgs_cell": None}
 
+    # Cot cuoi cua bang o sheet PL (cot KGS cua GROSS WEIGHT). So thua nam ngoai bang se khong bi lay.
+    _pl_ws, pl_head = find_text(source_wb, TABLE_HEADER_TEXT, ws)
+    kgs_last_col = header_last_col(ws, pl_head.row) if pl_head is not None else 17
+
     # --- Dong dong goi: trong khung tu dong TOTAL den truoc TOTAL WEIGHT, tren xuong, trai sang phai ---
     done = False
     for r in range(total_row, tw_row):
@@ -445,7 +515,7 @@ def extract_packing(source_wb):
 
     # --- KGS: so cuoi cung ben phai tren dong TOTAL WEIGHT (LBS truoc, KGS sau) ---
     nums, seen = [], set()
-    for c in range(tw_col + 1, TABLE_LAST_COL + 1):
+    for c in range(tw_col + 1, kgs_last_col + 1):
         cell = real_cell(ws, tw_row, c)
         if cell.coordinate in seen:
             continue
@@ -655,20 +725,26 @@ def extract_totals(source_wb):
     if total_row is None:
         return None
 
-    # Cot 'Extension' tim theo tieu de (2 cot: gia cong truoc, hang sau); khong thay thi dung O va Q
-    ext_cols = set()
-    for r in range(max(1, head.row - HEADER_ROWS_ABOVE), head.row + 1):
-        for c in range(TABLE_FIRST_COL, TABLE_LAST_COL + 1):
-            if norm(ws.cell(r, c).value) == "extension":
-                ext_cols.add(c)
-    ext_cols = sorted(ext_cols)
-    if len(ext_cols) >= 2:
-        proc_col, cust_col = ext_cols[0], ext_cols[-1]
+    # 2 cot 'Extension' (gia cong truoc, hang sau) lay theo tieu de, de khong bi lech khi co cot Brand name
+    cols = table_columns(ws, head)
+    if cols is not None:
+        proc_col, cust_col = cols[6], cols[8]
+        aldila = (cols[0], cols[1])
     else:
-        proc_col, cust_col = TABLE_FIRST_COL + 6, TABLE_LAST_COL   # O, Q
+        ext_cols = set()
+        for r in range(max(1, head.row - HEADER_ROWS_ABOVE), head.row + 1):
+            for c in range(TABLE_FIRST_COL, TABLE_LAST_COL + 1):
+                if norm(ws.cell(r, c).value) == "extension":
+                    ext_cols.add(c)
+        ext_cols = sorted(ext_cols)
+        if len(ext_cols) >= 2:
+            proc_col, cust_col = ext_cols[0], ext_cols[-1]
+        else:
+            proc_col, cust_col = LEGACY_TABLE_COLS[6], LEGACY_TABLE_COLS[8]   # O, Q
+        aldila = (TABLE_FIRST_COL, TABLE_FIRST_COL + 1)
 
     info = {"sheet": ws.title}
-    data_rows = [r for r in range(head.row + 1, total_row) if has_part(ws, r)]
+    data_rows = [r for r in range(head.row + 1, total_row) if has_part(ws, r, aldila)]
     for key, col in (("processing_total", proc_col), ("custom_total", cust_col)):
         cell = real_cell(ws, total_row, col)
         info[key] = to_number(cell.value)
@@ -866,15 +942,52 @@ def trim_extra_rows(target_wb, n_rows):
             print(f"  {ws.title}: da an dong {first_extra}-{last_row}")
 
 
-def recalc_with_excel(paths):
-    """Mo ngam tung file bang Excel, tinh lai cong thuc, luu lai -> file co san ket qua."""
-    if not paths:
+def _khoa_ship(s):
+    return " ".join(str(s or "").split()).casefold()
+
+
+def dien_tu_nho(target_wb, ship_to):
+    """Dien san ma dia diem tu lan khai truoc: C10 theo dung Ship to Name; C11, C32 theo lan gan nhat.
+    O nao da co gia tri thi giu nguyen. Ma ZZZ thi dien ca ten da go (cot D)."""
+    f = FOLDER / FILE_NHO
+    if not f.exists():
         return
+    try:
+        nho = json.loads(f.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"  [NHO] Khong doc duoc {f.name}: {e}")
+        return
+    ws = target_wb["Sheet1"]
+    da_dien = []
+    for o_ma, o_ten in (("C10", "D10"), ("C11", "D11"), ("C32", "D32")):
+        if ws[o_ma].value not in (None, ""):
+            continue
+        if o_ma == "C10":
+            muc = nho.get("theo_ship_to", {}).get(_khoa_ship(ship_to))
+        else:
+            muc = nho.get("gan_nhat", {}).get(o_ma)
+        if muc and muc.get("ma"):
+            ws[o_ma] = muc["ma"]
+            if muc.get("ten"):
+                ws[o_ten] = muc["ten"]
+            da_dien.append(f"{o_ma}={muc['ma']}" + (f" ({muc['ten']})" if muc.get("ten") else ""))
+    if da_dien:
+        print("  [NHO] Dien san tu lan truoc: " + ", ".join(da_dien))
+    if ws["C10"].value in (None, ""):
+        print(f"  [NHO] Chua co ma nhan hang cuoi cung cho '{ship_to}': dien tay C10 lan nay, lan sau se tu dien")
+
+
+def recalc_with_excel(paths):
+    """Mo ngam tung file bang Excel, tinh lai cong thuc, luu lai -> file co san ket qua.
+    Tra ve danh sach file con thieu (dong 2 Sheet1 bao 'CHUA DU'); None neu khong dung duoc Excel."""
+    thieu = []
+    if not paths:
+        return thieu
     try:
         import win32com.client as win32
     except ImportError:
         print("\nChua cai pywin32 nen chua tinh san ket qua. Chay lenh: pip install pywin32")
-        return
+        return None
 
     print("\nDang nho Excel tinh cong thuc (chay ngam)...")
     excel = None
@@ -888,7 +1001,12 @@ def recalc_with_excel(paths):
                 wb = excel.Workbooks.Open(str(Path(path).resolve()))
                 excel.CalculateFull()
                 wb.Save()
-                print(f"  Da tinh xong: {Path(path).name}")
+                trang_thai = str(wb.Worksheets("Sheet1").Range("A2").Value or "")
+                if "CHƯA ĐỦ" in trang_thai.upper():
+                    thieu.append(path)
+                    print(f"  Da tinh xong: {Path(path).name}  -> {trang_thai}")
+                else:
+                    print(f"  Da tinh xong: {Path(path).name}  -> du")
             except Exception as e:
                 print(f"  LOI khi tinh {Path(path).name}: {e}")
             finally:
@@ -897,30 +1015,33 @@ def recalc_with_excel(paths):
     finally:
         if excel is not None:
             excel.Quit()
+    return thieu
 
 
-def main():
+def main(files=None, mo_file=None):
+    """files: danh sach file IV + PL can xu ly (giao dien truyen vao). Bo trong = quet FOLDER nhu cu.
+    mo_file: tu mo file con thieu trong Excel (mac dinh theo MO_FILE_THIEU).
+    Tra ve (danh sach file da tao, danh sach file con thieu)."""
+    global TEMPLATE
+    if not TEMPLATE.exists() and (FOLDER / "Template.xlsx").exists():   # ten cu
+        TEMPLATE = FOLDER / "Template.xlsx"
     if not TEMPLATE.exists():
         print(f"Khong tim thay file mau: {TEMPLATE}")
-        return
+        return [], []
 
-    OUTPUT.mkdir(exist_ok=True)
+    OUTPUT.mkdir(parents=True, exist_ok=True)
 
-    files = [
-        f for f in INPUT_FOLDER.glob("IV + PL G-*.xlsx")
-        if not f.name.startswith("~$")
-        and f.resolve() != TEMPLATE.resolve()
-    ]
-    if not files and INPUT_FOLDER != BASE_DIR:
+    if files is None:
         files = [
-            f for f in BASE_DIR.glob("IV + PL G-*.xlsx")
+            f for f in FOLDER.glob("IV + PL G-*.xlsx")
             if not f.name.startswith("~$")
             and f.resolve() != TEMPLATE.resolve()
         ]
+    files = [Path(f) for f in files]
 
     if not files:
-        print(f"Khong tim thay file IV + PL G-*.xlsx trong {INPUT_FOLDER}")
-        return
+        print("Khong tim thay file IV + PL G-*.xlsx")
+        return [], []
 
     created = []
 
@@ -928,6 +1049,7 @@ def main():
         inv = get_inv(source_path.name)
 
         if not inv:
+            print(f"\nBo qua {source_path.name}: ten file khong co so invoice dang G-xx-xxxx")
             continue
 
         print(f"\nDang xu ly: {source_path.name}")
@@ -973,6 +1095,7 @@ def main():
             write_header(target_wb, head_info)
             write_totals(target_wb, totals_info)
             write_misc(target_wb, misc_info)
+            dien_tu_nho(target_wb, (misc_info or {}).get("ship_to_name"))
 
             # De Excel tu tinh lai cong thuc khi mo file
             target_wb.calculation.fullCalcOnLoad = True
@@ -990,10 +1113,22 @@ def main():
         except Exception as e:
             print(f"  LOI: {e}")
 
-    if RECALC_WITH_EXCEL:
-        recalc_with_excel(created)
+    thieu = recalc_with_excel(created) if RECALC_WITH_EXCEL else None
+    if thieu is None:
+        thieu = created          # khong biet trang thai (khong tinh duoc bang Excel) -> coi nhu can xem tat ca
+    if created:
+        print(f"\n{len(created) - len(thieu)}/{len(created)} file da du, chay ECUS duoc ngay.")
+    if thieu:
+        print(f"{len(thieu)} file can bo sung (o do, dong 2 Sheet1 ghi ro thieu gi):")
+        for f in thieu:
+            print(f"   - {Path(f).name}")
+        if (MO_FILE_THIEU if mo_file is None else mo_file) and hasattr(os, "startfile"):
+            for f in thieu:
+                os.startfile(str(f))
+            print("Da mo cac file nay trong Excel. Dien xong bam Ctrl+S, dong file, roi chay ECUS.")
 
     print("\nHoan tat!")
+    return created, thieu
 
 
 if __name__ == "__main__":

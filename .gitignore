@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Secrets
+api_key.txt
+.env
+*.key
+
+# Du lieu don hang that (input/output)
+Don hang/*/dau_vao/
+Don hang/*/output/
+
+# Office temp files
+~$*
